@@ -10,8 +10,11 @@
 #   GHCR_PUSH_TOKEN       classic PAT from the IMAGE_OWNER account with write:packages
 #                         (optional: without it the built-in GITHUB_TOKEN is used)
 #
+# Repo variable (Settings -> Secrets and variables -> Actions -> Variables):
+#   LEGION_GAME_ID        the game id on hosting.bloxity.io
+#
 # BEFORE THE FIRST RUN: the game must already exist on hosting.bloxity.io with the id
-# in GAME_ID. Legion has no create-on-deploy; an unknown app is a 404.
+# in LEGION_GAME_ID. Legion has no create-on-deploy; an unknown app is a 404.
 #
 # ONE-TIME after the first successful push: make the GHCR package public
 # (github.com/<IMAGE_OWNER>?tab=packages -> pattern-rush-server -> Package settings
@@ -33,7 +36,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GAME_ID: pattern-rush
+  GAME_ID: ${{ vars.LEGION_GAME_ID }}
   IMAGE_OWNER: ushandissanayaka
   IMAGE_NAME: pattern-rush-server
   # seatCap = players per pod. maxReplicas stays 1 because lobby and match state live in
@@ -47,10 +50,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the deploy token is present
+      - name: Check the deploy token and game id are present
         env:
           LEGION_TOKEN: ${{ secrets.LEGION_DEPLOY_TOKEN }}
         run: |
+          if [ -z "${GAME_ID:-}" ]; then
+            echo "::error::The LEGION_GAME_ID repository variable is not set."
+            echo "Add it under Settings -> Secrets and variables -> Actions -> Variables."
+            exit 1
+          fi
           if [ -z "${LEGION_TOKEN:-}" ]; then
             echo "::error::LEGION_DEPLOY_TOKEN is not set on this repository."
             echo "Add it under Settings -> Secrets and variables -> Actions."
