@@ -11,6 +11,10 @@ COPY src ./src
 # Legion requires a non-root user; the node image ships one called "node".
 USER node
 
+# Players one pod holds; the deploy workflow passes the same value it sends Legion as seatCap.
+ARG SEAT_CAP=50
+ENV SEAT_CAP=${SEAT_CAP}
+
 # Legion injects PORT (2567); 2567 is also the default here so the image runs the same locally.
 ENV PORT=2567
 EXPOSE 2567

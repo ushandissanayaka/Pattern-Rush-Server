@@ -39,10 +39,10 @@ env:
   GAME_ID: ${{ vars.LEGION_GAME_ID }}
   IMAGE_OWNER: ushandissanayaka
   IMAGE_NAME: pattern-rush-server
-  # seatCap = players per pod. maxReplicas stays 1 because lobby and match state live in
-  # one process's memory: a second pod would be a separate lobby.
+  # seatCap = players per pod (baked into the image as SEAT_CAP so the server refuses the
+  # 51st player). The matchmaker at play.bloxity.io fills a pod to seatCap, then starts another;
+  # each pod is its own lobby. maxReplicas is not sent: it can only raise Legion's limit.
   SEAT_CAP: 50
-  MAX_REPLICAS: 1
 
 jobs:
   deploy:
@@ -108,6 +108,7 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.image }}
+          build-args: SEAT_CAP=${{ env.SEAT_CAP }}
 
       - name: Deploy to Legion
         env:
@@ -118,8 +119,8 @@ jobs:
         run: |
           set -euo pipefail
           payload="$(jq -n --arg channel "$CHANNEL" --arg image "$IMAGE" --arg version "$VERSION" \
-            --argjson seatCap "$SEAT_CAP" --argjson maxReplicas "$MAX_REPLICAS" \
-            '{channel: $channel, image: $image, version: $version, seatCap: $seatCap, maxReplicas: $maxReplicas}')"
+            --argjson seatCap "$SEAT_CAP" \
+            '{channel: $channel, image: $image, version: $version, seatCap: $seatCap}')"
           echo "Deploying: $payload"
           body="$(mktemp)"
           code="$(curl -sS -o "$body" -w '%{http_code}' -X POST \
@@ -136,4 +137,5 @@ jobs:
             *) echo "::error::Deploy failed (HTTP ${code}). If the image cannot be pulled, make the GHCR package public."; exit 1 ;;
           esac
           if [ "$CHANNEL" = "dev" ]; then host="${GAME_ID}.dev.host.bloxity.io"; else host="${GAME_ID}.host.bloxity.io"; fi
-          echo "Backend: https://${host}  (health: https://${host}/health)"
+          echo "Backend (HTTP only): https://${host}  (health: https://${host}/health)"
+          echo "Game sockets go through Legion.SDK.net.resolveEndpoint('${GAME_ID}') -> wss://play.bloxity.io/v1/ws/<roomId>/api/realtime"

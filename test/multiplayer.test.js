@@ -18,11 +18,11 @@ async function unusedPort() {
   return port;
 }
 
-async function startServer() {
+async function startServer(env = {}) {
   const port = await unusedPort();
   const child = spawn(process.execPath, ['src/index.js'], {
     cwd: serverDirectory,
-    env: { ...process.env, PORT: String(port), CORS_ORIGIN: '*', QUEUE_DELAY_MS: '100' },
+    env: { ...process.env, MONGODB_URI: '', PORT: String(port), CORS_ORIGIN: '*', QUEUE_DELAY_MS: '100', ...env },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';
@@ -238,4 +238,117 @@ test('booth pads seat players directly and queued players fill a waiting booth',
   assert.equal((await waitFor(solo, (message) => message.type === 'bot-station')).stationId, 'R5');
   const practice = await waitFor(padA, (message) => seatedAt('R5')(message) && message.bot);
   assert.equal(practice.waiting, false);
+});
+
+// Stands in for api.bloxity.io: "token-<id>" is a valid Boxity token for account <id>.
+async function startFakeBoxityApi() {
+  const api = createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    if (req.url !== '/v1/auth/me' || !token.startsWith('token-')) {
+      res.writeHead(401).end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ user: { _id: token.slice('token-'.length), username: 'buyer' } }));
+  });
+  api.listen(0, '127.0.0.1');
+  await once(api, 'listening');
+  return { api, url: `http://127.0.0.1:${api.address().port}` };
+}
+
+const postWebhook = (port, body, headers = {}) => fetch(`http://127.0.0.1:${port}/api/legion-webhook`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', ...headers },
+  body: JSON.stringify(body)
+});
+
+test('verifies Boxity accounts, relays emotes and keeps the avatar a client describes', { timeout: 20000 }, async (t) => {
+  const { api, url } = await startFakeBoxityApi();
+  const { child, port } = await startServer({ BLOXITY_API_URL: url });
+  const clients = [];
+  t.after(() => {
+    for (const client of clients) client.socket.close();
+    child.kill('SIGKILL');
+    api.close();
+  });
+  const me = await connect(port, 'me');
+  const other = await connect(port, 'other');
+  clients.push(me, other);
+
+  send(me, 'identify', {
+    token: 'token-acc1',
+    player: {
+      name: 'Me',
+      skinUrl: 'https://api.bloxity.io/v1/avatar/skin-texture/s3_sh12_fc4.png',
+      equipped: { hatId: '7', maskId: '9', shoesId: '2', bogus: 'x' },
+      proportions: { height: 9, headScale: 0.1, shoulderWidth: 1.2 }
+    }
+  });
+  const verified = await waitFor(other, (message) => message.type === 'player-updated' && message.player.userId === 'acc1');
+  assert.equal(verified.player.skinUrl, 'https://api.bloxity.io/v1/avatar/skin-texture/s3_sh12_fc4.png');
+  assert.deepEqual(verified.player.equipped, { hatId: '7', maskId: '9', shoesId: '2' });
+  assert.deepEqual(verified.player.proportions, { height: 1.6, shoulderWidth: 1.2, headScale: 0.3 });
+
+  // a token Boxity rejects never yields an account id
+  send(other, 'identify', { token: 'forged', player: { name: 'Other' } });
+  await waitFor(me, (message) => message.type === 'player-updated' && message.player.name === 'Other');
+  await delay(200);
+  assert.equal(me.messages.some((message) => message.type === 'player-updated' && message.player.id === 'other' && message.player.userId), false);
+
+  send(me, 'emote', { emoteId: '0123456789abcdef01234567' });
+  send(me, 'emote', { emoteId: 'not-an-emote' });
+  send(me, 'emote', { emoteId: null });
+  const emotes = [
+    await waitFor(other, (message) => message.type === 'player-emote' && message.emoteId),
+    await waitFor(other, (message) => message.type === 'player-emote' && message.emoteId === null)
+  ];
+  assert.deepEqual(emotes.map((message) => message.id), ['me', 'me']);
+  assert.equal(other.messages.filter((message) => message.type === 'player-emote').length, 2);
+});
+
+test('records Gems webhooks once and hands the grant to the verified buyer', { timeout: 20000 }, async (t) => {
+  const { api, url } = await startFakeBoxityApi();
+  const { child, port } = await startServer({ BLOXITY_API_URL: url, LEGION_WEBHOOK_SECRET: 's3cret' });
+  const clients = [];
+  t.after(() => {
+    for (const client of clients) client.socket.close();
+    child.kill('SIGKILL');
+    api.close();
+  });
+  const grant = { transactionId: 'tx-1', userId: 'acc9', username: 'buyer', gameSlug: 'pattern-rush', sku: 'coins_500', productName: '500 coins', productPrice: 50, metadata: { a: 1 }, timestamp: Date.now() };
+
+  assert.equal((await postWebhook(port, grant)).status, 401);
+  assert.equal((await postWebhook(port, grant, { 'x-legion-webhook-secret': 'wrong' })).status, 401);
+  assert.equal((await postWebhook(port, { sku: 'x' }, { 'x-legion-webhook-secret': 's3cret' })).status, 400);
+  const ok = await postWebhook(port, grant, { 'x-legion-webhook-secret': 's3cret' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { success: true, transactionId: 'tx-1' });
+  // Boxity retries are acknowledged without granting twice
+  assert.equal((await postWebhook(port, grant, { 'x-legion-webhook-secret': 's3cret' })).status, 200);
+
+  const buyer = await connect(port, 'buyer');
+  const bystander = await connect(port, 'bystander');
+  clients.push(buyer, bystander);
+  send(bystander, 'identify', { token: 'token-acc2', player: { name: 'Bystander' } });
+  send(buyer, 'identify', { token: 'token-acc9', player: { name: 'Buyer' } });
+  const delivered = await waitFor(buyer, (message) => message.type === 'gems-grant');
+  assert.deepEqual(delivered.grant, { transactionId: 'tx-1', sku: 'coins_500', productName: '500 coins', metadata: { a: 1 } });
+  await delay(300);
+  assert.equal(buyer.messages.filter((message) => message.type === 'gems-grant').length, 1);
+  assert.equal(bystander.messages.some((message) => message.type === 'gems-grant'), false);
+});
+
+test('refuses new players once the pod reaches its seat cap', { timeout: 20000 }, async (t) => {
+  const { child, port } = await startServer({ SEAT_CAP: '2' });
+  const clients = [];
+  t.after(() => {
+    for (const client of clients) client.socket.close();
+    child.kill('SIGKILL');
+  });
+  clients.push(await connect(port, 'one'), await connect(port, 'two'));
+  await assert.rejects(connect(port, 'three'), /503/);
+  // a seated player reconnecting keeps their place
+  const again = await connect(port, 'two');
+  clients.push(again);
+  await waitFor(again, (message) => message.type === 'snapshot');
 });
