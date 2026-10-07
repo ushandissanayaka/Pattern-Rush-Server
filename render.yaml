@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: cipher-clash-server
-    runtime: node
-    rootDir: server
-    buildCommand: npm install
-    startCommand: npm start
-    healthCheckPath: /api/health

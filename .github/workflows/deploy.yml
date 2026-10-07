@@ -1,0 +1,131 @@
+# ============================================================
+# Pattern Rush server -> Bloxity Legion
+# ============================================================
+# Branch -> channel:
+#   dev   -> dev  channel  (https://<GAME_ID>.dev.host.bloxity.io)
+#   main  -> prod channel  (https://<GAME_ID>.host.bloxity.io)
+#
+# Repo secrets (Settings -> Secrets and variables -> Actions):
+#   LEGION_DEPLOY_TOKEN   deploy token from hosting.bloxity.io
+#   GHCR_PUSH_TOKEN       classic PAT from the IMAGE_OWNER account with write:packages
+#                         (optional: without it the built-in GITHUB_TOKEN is used)
+#
+# BEFORE THE FIRST RUN: the game must already exist on hosting.bloxity.io with the id
+# in GAME_ID. Legion has no create-on-deploy; an unknown app is a 404.
+#
+# ONE-TIME after the first successful push: make the GHCR package public
+# (github.com/<IMAGE_OWNER>?tab=packages -> pattern-rush-server -> Package settings
+# -> Change visibility -> Public), otherwise Legion cannot pull the image.
+
+name: Deploy to Bloxity
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  GAME_ID: pattern-rush
+  IMAGE_OWNER: ushandissanayaka
+  IMAGE_NAME: pattern-rush-server
+  # seatCap = players per pod. maxReplicas stays 1 because lobby and match state live in
+  # one process's memory: a second pod would be a separate lobby.
+  SEAT_CAP: 50
+  MAX_REPLICAS: 1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deploy token is present
+        env:
+          LEGION_TOKEN: ${{ secrets.LEGION_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "${LEGION_TOKEN:-}" ]; then
+            echo "::error::LEGION_DEPLOY_TOKEN is not set on this repository."
+            echo "Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "Deploy token present (${#LEGION_TOKEN} characters)."
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Run tests
+        run: npm ci && npm test
+
+      - name: Work out channel and image
+        id: meta
+        env:
+          GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "dev" ]; then channel=dev; else channel=prod; fi
+          sha="${GITHUB_SHA::7}"
+          if [ -n "${GHCR_PUSH_TOKEN:-}" ]; then
+            owner="${IMAGE_OWNER,,}"
+            user="${IMAGE_OWNER}"
+          else
+            owner="${GITHUB_REPOSITORY_OWNER,,}"
+            user="${GITHUB_ACTOR}"
+          fi
+          image="ghcr.io/${owner}/${IMAGE_NAME}:${channel}-${sha}"
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "user=${user}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Channel: ${channel}  Image: ${image}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ steps.meta.outputs.user }}
+          password: ${{ secrets.GHCR_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+
+      - name: Deploy to Legion
+        env:
+          LEGION_TOKEN: ${{ secrets.LEGION_DEPLOY_TOKEN }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n --arg channel "$CHANNEL" --arg image "$IMAGE" --arg version "$VERSION" \
+            --argjson seatCap "$SEAT_CAP" --argjson maxReplicas "$MAX_REPLICAS" \
+            '{channel: $channel, image: $image, version: $version, seatCap: $seatCap, maxReplicas: $maxReplicas}')"
+          echo "Deploying: $payload"
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' -X POST \
+            "https://legion.bloxity.io/v1/apps/${GAME_ID}/deploy" \
+            -H "Authorization: Bearer ${LEGION_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$payload")"
+          echo "Legion answered HTTP ${code}:"
+          cat "$body"; echo
+          case "$code" in
+            2*) ;;
+            401|403) echo "::error::Legion rejected the token. Check LEGION_DEPLOY_TOKEN."; exit 1 ;;
+            404) echo "::error::No app '${GAME_ID}' on Legion. Create it on hosting.bloxity.io or fix GAME_ID."; exit 1 ;;
+            *) echo "::error::Deploy failed (HTTP ${code}). If the image cannot be pulled, make the GHCR package public."; exit 1 ;;
+          esac
+          if [ "$CHANNEL" = "dev" ]; then host="${GAME_ID}.dev.host.bloxity.io"; else host="${GAME_ID}.host.bloxity.io"; fi
+          echo "Backend: https://${host}  (health: https://${host}/health)"

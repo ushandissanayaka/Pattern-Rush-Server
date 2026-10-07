@@ -37,7 +37,7 @@ async function startServer() {
     } catch {}
     await delay(100);
   }
-  child.kill();
+  child.kill('SIGKILL');
   throw new Error(`Server did not start:\n${output}`);
 }
 
@@ -89,7 +89,7 @@ test('pairs queued players at random into separate booths that everyone can watc
   const clients = [];
   t.after(() => {
     for (const client of clients) client.socket.close();
-    child.kill();
+    child.kill('SIGKILL');
   });
 
   const ids = ['player-a', 'player-b', 'player-c', 'player-d', 'player-e'];
@@ -169,7 +169,7 @@ test('keeps a lone queued player waiting and gives solo bot practice its own boo
   const clients = [];
   t.after(() => {
     for (const client of clients) client.socket.close();
-    child.kill();
+    child.kill('SIGKILL');
   });
   const solo = await connect(port, 'solo');
   const other = await connect(port, 'other');
@@ -197,7 +197,7 @@ test('booth pads seat players directly and queued players fill a waiting booth',
   const clients = [];
   t.after(() => {
     for (const client of clients) client.socket.close();
-    child.kill();
+    child.kill('SIGKILL');
   });
   for (const id of ['pad-a', 'pad-b', 'pad-c', 'queued', 'solo']) clients.push(await connect(port, id));
   const [padA, padB, padC, queued, solo] = clients;

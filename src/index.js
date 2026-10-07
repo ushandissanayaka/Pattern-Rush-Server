@@ -2,7 +2,11 @@ import { createServer } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 
 const port = Number(process.env.PORT || 3000);
-const allowedOrigins = new Set((process.env.CORS_ORIGIN || '*').split(',').map((origin) => origin.trim()));
+// Bloxity Legion injects CLIENT_ORIGIN; CORS_ORIGIN still works for local runs.
+const allowedOrigins = new Set((process.env.CLIENT_ORIGIN || process.env.CORS_ORIGIN || '*').split(',').map((origin) => origin.trim()));
+// Legion waits up to 10 minutes after SIGTERM; leave headroom before it force-kills the pod.
+const DRAIN_TIMEOUT_MS = Math.max(0, Number(process.env.DRAIN_TIMEOUT_MS ?? 9 * 60 * 1000));
+let draining = false;
 const server = createServer((req, res) => {
   const origin = req.headers.origin;
   if (origin && (allowedOrigins.has('*') || allowedOrigins.has(origin))) {
@@ -16,7 +20,9 @@ const server = createServer((req, res) => {
     res.writeHead(204).end();
     return;
   }
-  if (req.method === 'GET' && req.url === '/api/health') {
+  const path = req.url.split('?')[0];
+  // Legion's readiness and liveness probes hit /health; /api/health is kept for existing clients.
+  if (req.method === 'GET' && (path === '/health' || path === '/api/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ status: 'ok', service: 'cipher-clash-server' }));
     return;
@@ -325,9 +331,15 @@ function handleMatchEvent(player, event) {
   }
 }
 
+const RESTART_MESSAGE = 'The server is restarting. Rejoin in a moment to play.';
+
 function handleMessage(player, socket, message) {
   if (!message || typeof message !== 'object' || typeof message.type !== 'string') {
     send(socket, { type: 'error', message: 'Invalid message.' });
+    return;
+  }
+  if (draining && ['join-queue', 'join-station', 'play-bot'].includes(message.type)) {
+    send(socket, { type: 'join-denied', stationId: message.stationId, color: message.color, message: RESTART_MESSAGE });
     return;
   }
   if (message.type === 'identify') {
@@ -458,4 +470,37 @@ server.on('close', () => {
   clearInterval(heartbeat);
   clearTimeout(matchmakingTimer);
   for (const socket of webSockets.clients) socket.close();
+});
+
+// Graceful drain for deploys and scale-down: matches already running are allowed to finish,
+// no new ones start, and everyone is then disconnected so their clients reconnect to a fresh pod.
+const hasLiveMatch = () => [...stations.values()].some((room) => room.inProgress && !room.winnerId);
+
+function finishDrain() {
+  console.log('[drain] closing remaining connections and exiting');
+  for (const socket of webSockets.clients) socket.close(1012, 'Server restarting');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.once('SIGTERM', () => {
+  if (draining) return;
+  draining = true;
+  console.log('[drain] SIGTERM received, waiting for running matches to finish');
+  clearTimeout(matchmakingTimer);
+  for (const id of [...queue]) {
+    queue.delete(id);
+    send(clients.get(id), { type: 'queue-status', queued: false, size: 0 });
+    send(clients.get(id), { type: 'join-denied', message: RESTART_MESSAGE });
+  }
+  const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+  const check = setInterval(() => {
+    if (hasLiveMatch() && Date.now() < deadline) return;
+    clearInterval(check);
+    finishDrain();
+  }, 1000);
+  if (!hasLiveMatch()) {
+    clearInterval(check);
+    finishDrain();
+  }
 });
