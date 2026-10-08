@@ -1,12 +1,20 @@
 import { createServer } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
+import { cleanIdentity, verifyBoxityToken } from './players/identity.js';
+import { createGrantStore } from './progress/gem-grants.js';
+import { createWebhookHandler } from './routes/legion-webhook.js';
 
 const port = Number(process.env.PORT || 3000);
+// One pod holds at most SEAT_CAP players; this must equal the seatCap the workflow deploys with,
+// because Legion's matchmaker fills a pod to that number and then starts another one.
+const SEAT_CAP = Math.max(1, Number(process.env.SEAT_CAP || 50));
 // Bloxity Legion injects CLIENT_ORIGIN; CORS_ORIGIN still works for local runs.
 const allowedOrigins = new Set((process.env.CLIENT_ORIGIN || process.env.CORS_ORIGIN || '*').split(',').map((origin) => origin.trim()));
 // Legion waits up to 10 minutes after SIGTERM; leave headroom before it force-kills the pod.
 const DRAIN_TIMEOUT_MS = Math.max(0, Number(process.env.DRAIN_TIMEOUT_MS ?? 9 * 60 * 1000));
 let draining = false;
+const grantStore = createGrantStore();
+const handleWebhook = createWebhookHandler({ store: grantStore, onGrant: () => applyGrants() });
 const server = createServer((req, res) => {
   const origin = req.headers.origin;
   if (origin && (allowedOrigins.has('*') || allowedOrigins.has(origin))) {
@@ -27,6 +35,13 @@ const server = createServer((req, res) => {
     res.end(JSON.stringify({ status: 'ok', service: 'cipher-clash-server' }));
     return;
   }
+  if (req.method === 'POST' && path === '/api/legion-webhook') {
+    handleWebhook(req, res).catch((error) => {
+      console.error('[gems] webhook failed:', error.message);
+      if (!res.headersSent) res.writeHead(500).end();
+    });
+    return;
+  }
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
@@ -43,8 +58,13 @@ const QUEUE_DELAY_MS = Math.max(0, Number(process.env.QUEUE_DELAY_MS ?? 2500));
 const queue = new Set();
 let matchmakingTimer = null;
 
+const EMOTE_ID = /^[a-f0-9]{24}$/i;
+const GRANT_POLL_MS = 5000;
+
+// userId is the verified Boxity account id (null for guests): clients key chat bubbles by it.
 const publicPlayer = (player) => ({
   id: player.id,
+  userId: player.userId,
   name: player.name,
   skinUrl: player.skinUrl,
   equipped: player.equipped,
@@ -261,23 +281,46 @@ function closePlayer(playerId) {
   broadcast({ type: 'player-left', id: playerId });
 }
 
-function cleanIdentity(player, identity) {
-  if (!identity || typeof identity !== 'object') return;
-  if (typeof identity.name === 'string') player.name = identity.name.trim().slice(0, 24) || 'Player';
-  if (typeof identity.skinUrl === 'string' && /^https:\/\/static\.bloxity\.io\/avatars\//i.test(identity.skinUrl)) {
-    player.skinUrl = identity.skinUrl.slice(0, 512);
+// The client sends its Boxity token (Legion.SDK.auth.getToken()) with identify; the account id is
+// only ever taken from Boxity's answer, never from the client. No token means a guest.
+async function setAccount(player, token) {
+  if (typeof token !== 'string' || !token) {
+    player.token = null;
+    if (!player.userId) return;
+    player.userId = null;
+    broadcast({ type: 'player-updated', player: publicPlayer(player) });
+    return;
   }
-  if (identity.equipped && typeof identity.equipped === 'object' && !Array.isArray(identity.equipped)) {
-    const equipped = {};
-    for (const key of ['headId', 'torsoId', 'armLId', 'armRId', 'legLId', 'legRId', 'hatId', 'hairId', 'backId']) {
-      const value = identity.equipped[key];
-      if (typeof value === 'string' || typeof value === 'number') equipped[key] = String(value).slice(0, 40);
+  if (token === player.token) return;
+  player.token = token;
+  const account = await verifyBoxityToken(token);
+  if (player.token !== token || !players.has(player.id)) return; // a newer identify won the race
+  const userId = account?.userId || null;
+  if (userId === player.userId) return;
+  player.userId = userId;
+  broadcast({ type: 'player-updated', player: publicPlayer(player) });
+  if (userId) applyGrants();
+}
+
+// Hands Gems purchases recorded by the webhook (on any pod) to the buyers connected to this pod.
+let applyingGrants = false;
+async function applyGrants() {
+  if (applyingGrants) return;
+  applyingGrants = true;
+  try {
+    const online = [...players.values()].filter((player) => player.userId && clients.get(player.id)?.readyState === WebSocket.OPEN);
+    const grants = await grantStore.claimFor([...new Set(online.map((player) => player.userId))]);
+    for (const grant of grants) {
+      const message = {
+        type: 'gems-grant',
+        grant: { transactionId: grant._id, sku: grant.sku, productName: grant.productName, metadata: grant.metadata ?? null }
+      };
+      for (const player of online) if (player.userId === grant.userId) send(clients.get(player.id), message);
     }
-    player.equipped = equipped;
-  }
-  if (identity.proportions && typeof identity.proportions === 'object') {
-    const height = Number(identity.proportions.height);
-    if (Number.isFinite(height)) player.proportions = { height: Math.min(1.5, Math.max(0.5, height)) };
+  } catch (error) {
+    console.warn('[gems] could not apply grants:', error.message);
+  } finally {
+    applyingGrants = false;
   }
 }
 
@@ -345,6 +388,14 @@ function handleMessage(player, socket, message) {
   if (message.type === 'identify') {
     cleanIdentity(player, message.player);
     broadcast({ type: 'player-updated', player: publicPlayer(player) }, player.id);
+    setAccount(player, message.token).catch((error) => console.warn('[identity] account check failed:', error.message));
+    return;
+  }
+  // Boxity draws the emote picker; the client plays the emote and we relay it to everyone else.
+  if (message.type === 'emote') {
+    const emoteId = message.emoteId === null ? null : String(message.emoteId ?? '');
+    if (emoteId !== null && !EMOTE_ID.test(emoteId)) return;
+    broadcast({ type: 'player-emote', id: player.id, emoteId }, player.id);
     return;
   }
   if (message.type === 'move') {
@@ -403,6 +454,15 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
+  // A reconnecting player keeps their seat; a new one is refused once the pod is full. While this
+  // pod drains, only players in a running match get back in; everyone else is turned away, so
+  // their client retries and the matchmaker places them on the new pod (no hop-reconnect loop).
+  const known = players.get(id);
+  if ((!known && players.size >= SEAT_CAP) || (draining && !isLive(stations.get(known?.stationId)))) {
+    socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   webSockets.handleUpgrade(req, socket, head, (ws) => webSockets.emit('connection', ws, req, id));
 });
 
@@ -413,6 +473,8 @@ webSockets.on('connection', (socket, _req, id) => {
   if (!player) {
     player = {
       id,
+      userId: null,
+      token: null,
       name: 'Player',
       skinUrl: 'https://static.bloxity.io/avatars/skins/0.png',
       equipped: {},
@@ -462,19 +524,35 @@ const heartbeat = setInterval(() => {
 }, 30000);
 heartbeat.unref();
 
+const grantPoll = setInterval(applyGrants, GRANT_POLL_MS);
+grantPoll.unref();
+
 server.listen(port, '0.0.0.0', () => {
-  console.log(`Cipher Clash server listening at http://localhost:${port}`);
+  console.log(`Cipher Clash server listening at http://localhost:${port} (seat cap ${SEAT_CAP})`);
 });
 
 server.on('close', () => {
   clearInterval(heartbeat);
+  clearInterval(grantPoll);
+  grantStore.close().catch(() => {});
   clearTimeout(matchmakingTimer);
   for (const socket of webSockets.clients) socket.close();
 });
 
 // Graceful drain for deploys and scale-down: matches already running are allowed to finish,
 // no new ones start, and everyone is then disconnected so their clients reconnect to a fresh pod.
-const hasLiveMatch = () => [...stations.values()].some((room) => room.inProgress && !room.winnerId);
+const isLive = (room) => Boolean(room?.inProgress && !room.winnerId);
+const hasLiveMatch = () => [...stations.values()].some(isLive);
+
+// Players who are not in a running match are closed with 1012 straight away, so their client
+// resolves a new endpoint through the matchmaker and lands on the fresh pod.
+function hopIdlePlayers() {
+  for (const player of players.values()) {
+    if (isLive(stations.get(player.stationId))) continue;
+    const socket = clients.get(player.id);
+    if (socket?.readyState === WebSocket.OPEN) socket.close(1012, 'Server restarting');
+  }
+}
 
 function finishDrain() {
   console.log('[drain] closing remaining connections and exiting');
@@ -493,8 +571,10 @@ process.once('SIGTERM', () => {
     send(clients.get(id), { type: 'queue-status', queued: false, size: 0 });
     send(clients.get(id), { type: 'join-denied', message: RESTART_MESSAGE });
   }
+  hopIdlePlayers();
   const deadline = Date.now() + DRAIN_TIMEOUT_MS;
   const check = setInterval(() => {
+    hopIdlePlayers();
     if (hasLiveMatch() && Date.now() < deadline) return;
     clearInterval(check);
     finishDrain();
