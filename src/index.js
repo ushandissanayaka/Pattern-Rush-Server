@@ -454,8 +454,11 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // A reconnecting player keeps their seat; a new one is refused once the pod is full.
-  if (!players.has(id) && players.size >= SEAT_CAP) {
+  // A reconnecting player keeps their seat; a new one is refused once the pod is full. While this
+  // pod drains, only players in a running match get back in; everyone else is turned away, so
+  // their client retries and the matchmaker places them on the new pod (no hop-reconnect loop).
+  const known = players.get(id);
+  if ((!known && players.size >= SEAT_CAP) || (draining && !isLive(stations.get(known?.stationId)))) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
     socket.destroy();
     return;

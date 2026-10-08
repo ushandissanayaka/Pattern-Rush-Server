@@ -352,3 +352,37 @@ test('refuses new players once the pod reaches its seat cap', { timeout: 20000 }
   clients.push(again);
   await waitFor(again, (message) => message.type === 'snapshot');
 });
+
+// SIGTERM cannot be delivered to a child process on Windows; this runs in CI (Linux) before deploy.
+test('a draining pod moves idle players off and only lets players in a running match back in', { timeout: 20000, skip: process.platform === 'win32' }, async (t) => {
+  const { child, port } = await startServer({ DRAIN_TIMEOUT_MS: '15000' });
+  const clients = [];
+  t.after(() => {
+    for (const client of clients) client.socket.close();
+    if (child.exitCode === null) child.kill('SIGKILL');
+  });
+  const idle = await connect(port, 'idle');
+  const red = await connect(port, 'red');
+  const blue = await connect(port, 'blue');
+  clients.push(idle, red, blue);
+  send(red, 'join-station', { stationId: 'L2', color: 'red' });
+  send(blue, 'join-station', { stationId: 'L2', color: 'blue' });
+  await waitFor(red, (message) => message.type === 'match-ready');
+
+  const [idleClosed] = await Promise.all([once(idle.socket, 'close'), child.kill('SIGTERM')]);
+  assert.equal(idleClosed[0], 1012);
+  // the hopped player and newcomers are refused, so their clients go back to the matchmaker
+  await assert.rejects(connect(port, 'idle'), /503/);
+  await assert.rejects(connect(port, 'newcomer'), /503/);
+  // a player in the running match can reconnect to finish it
+  red.socket.close();
+  const back = await connect(port, 'red');
+  clients.push(back);
+  await waitFor(back, (message) => message.type === 'snapshot');
+  assert.equal(blue.socket.readyState, WebSocket.OPEN);
+
+  // once the match ends, the pod closes everyone and exits cleanly
+  send(back, 'leave-station');
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 0);
+});

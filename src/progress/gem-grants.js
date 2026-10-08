@@ -45,12 +45,32 @@ function memoryStore() {
 }
 
 function mongoStore(uri) {
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
-  const grants = client.db().collection('gem_grants');
-  grants.createIndex({ userId: 1, applied: 1 }).catch((error) => console.warn('[gems] index setup failed:', error.message));
+  // A MongoClient whose first connect fails stays closed for good ("Topology is closed"), so a
+  // failed connect is thrown away and the next call starts a fresh client. Once connected, the
+  // driver itself rides out later outages.
+  let connection = null;
+  function collection() {
+    if (!connection) {
+      const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+      connection = client.connect()
+        .then(async () => {
+          const grants = client.db().collection('gem_grants');
+          await grants.createIndex({ userId: 1, applied: 1 }).catch((error) => console.warn('[gems] index setup failed:', error.message));
+          return { client, grants };
+        })
+        .catch((error) => {
+          connection = null;
+          client.close().catch(() => {});
+          throw error;
+        });
+    }
+    return connection.then(({ grants }) => grants);
+  }
+  collection().catch((error) => console.warn('[gems] Mongo not reachable yet, will retry:', error.message));
   return {
     // Idempotent: Boxity may retry a webhook, and a transactionId is only ever recorded once.
     async record(grant) {
+      const grants = await collection();
       await grants.updateOne(
         { _id: grant.transactionId },
         { $setOnInsert: { ...grantFields(grant), applied: false, receivedAt: new Date() } },
@@ -60,6 +80,7 @@ function mongoStore(uri) {
     // Each grant is claimed with a conditional update, so two pods never apply the same one.
     async claimFor(userIds) {
       if (!userIds.length) return [];
+      const grants = await collection();
       const pending = await grants.find({ userId: { $in: userIds }, applied: false }, { projection: { _id: 1 } }).limit(100).toArray();
       const claimed = [];
       for (const { _id } of pending) {
@@ -72,6 +93,10 @@ function mongoStore(uri) {
       }
       return claimed;
     },
-    close: () => client.close()
+    async close() {
+      const current = connection;
+      connection = null;
+      if (current) await current.then(({ client }) => client.close(), () => {});
+    }
   };
 }
